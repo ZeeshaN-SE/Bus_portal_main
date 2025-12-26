@@ -1,0 +1,449 @@
+================================================================================
+KUICKPAY PAYMENT GATEWAY INTEGRATION GUIDE
+================================================================================
+
+OVERVIEW:
+---------
+Kuickpay is a Pakistani payment gateway that allows integration with various
+payment methods including:
+- Credit/Debit Cards
+- Bank Accounts
+- Mobile Wallets (JazzCash, EasyPaisa)
+- Over-the-counter payments
+
+This guide helps you integrate Kuickpay for fee payment in your university
+bus tracking application.
+
+================================================================================
+INTEGRATION STEPS:
+================================================================================
+
+STEP 1: GET KUICKPAY MERCHANT ACCOUNT
+--------------------------------------
+1. Visit: https://kuickpay.com or https://merchant.kuickpay.com
+2. Sign up as a merchant
+3. Complete KYC (Know Your Customer) verification
+4. Get your credentials:
+   - Merchant ID
+   - API Key / Secret Key
+   - Webhook Secret
+5. Get access to sandbox/test environment
+
+STEP 2: UNDERSTAND KUICKPAY API FLOW
+-------------------------------------
+Standard Payment Flow:
+
+1. Customer initiates payment on your app
+   ↓
+2. Your backend creates payment request to Kuickpay API
+   ↓
+3. Kuickpay returns payment URL/token
+   ↓
+4. Redirect customer to Kuickpay payment page (WebView or Browser)
+   ↓
+5. Customer completes payment on Kuickpay
+   ↓
+6. Kuickpay sends webhook callback to your server
+   ↓
+7. Your server verifies and processes the payment
+   ↓
+8. Update challan status and notify student
+
+================================================================================
+BACKEND IMPLEMENTATION (Node.js/Express):
+================================================================================
+
+1. PAYMENT INITIATION ENDPOINT
+-------------------------------
+
+```javascript
+// POST /api/payments/initiate
+async function initiatePayment(req, res) {
+  const { challanId, userId } = req.body;
+  
+  // 1. Get challan details
+  const challan = await Challan.findById(challanId);
+  
+  // 2. Create payment record
+  const payment = await Payment.create({
+    challanId,
+    userId,
+    amount: challan.total_amount,
+    payment_method: 'kuickpay',
+    payment_status: 'pending'
+  });
+  
+  // 3. Call Kuickpay API
+  const kuickpayResponse = await axios.post(
+    'https://api.kuickpay.com/v1/payments/create',
+    {
+      merchant_id: process.env.KUICKPAY_MERCHANT_ID,
+      order_id: payment.id,
+      amount: challan.total_amount,
+      currency: 'PKR',
+      customer_name: req.user.full_name,
+      customer_email: req.user.email,
+      customer_phone: req.user.phone_number,
+      return_url: `${process.env.APP_URL}/payment/success`,
+      cancel_url: `${process.env.APP_URL}/payment/cancel`,
+      webhook_url: `${process.env.API_URL}/api/payments/kuickpay/callback`,
+      description: `Fee Payment - Challan ${challan.challan_number}`
+    },
+    {
+      headers: {
+        'Authorization': `Bearer ${process.env.KUICKPAY_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    }
+  );
+  
+  // 4. Store Kuickpay transaction ID
+  await payment.update({
+    transaction_id: kuickpayResponse.data.transaction_id
+  });
+  
+  // 5. Return payment URL to app
+  return res.json({
+    success: true,
+    payment_url: kuickpayResponse.data.payment_url,
+    transaction_id: kuickpayResponse.data.transaction_id
+  });
+}
+```
+
+2. WEBHOOK HANDLER
+------------------
+
+```javascript
+// POST /api/payments/kuickpay/callback
+async function kuickpayWebhook(req, res) {
+  try {
+    // 1. Verify webhook signature
+    const signature = req.headers['x-kuickpay-signature'];
+    const isValid = verifyKuickpaySignature(req.body, signature);
+    
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+    
+    const { 
+      transaction_id, 
+      order_id, 
+      status, 
+      amount,
+      payment_method 
+    } = req.body;
+    
+    // 2. Find payment record
+    const payment = await Payment.findById(order_id);
+    
+    if (!payment) {
+      return res.status(404).json({ error: 'Payment not found' });
+    }
+    
+    // 3. Update payment status
+    await payment.update({
+      payment_status: status, // 'success', 'failed', 'pending'
+      payment_gateway_response: req.body,
+      paid_at: status === 'success' ? new Date() : null
+    });
+    
+    // 4. If payment successful, update challan
+    if (status === 'success') {
+      const challan = await Challan.findById(payment.challanId);
+      await challan.update({ status: 'paid' });
+      
+      // Update user fee status
+      const user = await User.findById(payment.userId);
+      await user.update({ fee_status: 'paid' });
+      
+      // Generate receipt
+      const receiptUrl = await generateReceipt(payment.id);
+      await payment.update({ receipt_url: receiptUrl });
+      
+      // Send push notification
+      await sendNotification(user.id, {
+        title: 'Payment Successful',
+        body: `Your fee payment of Rs. ${amount} has been received.`,
+        data: { type: 'payment_success', payment_id: payment.id }
+      });
+      
+      // Send email receipt
+      await sendEmailReceipt(user.email, payment.id);
+    }
+    
+    // 5. Acknowledge webhook
+    return res.status(200).json({ received: true });
+    
+  } catch (error) {
+    console.error('Webhook error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+function verifyKuickpaySignature(payload, signature) {
+  const crypto = require('crypto');
+  const secret = process.env.KUICKPAY_WEBHOOK_SECRET;
+  
+  const hash = crypto
+    .createHmac('sha256', secret)
+    .update(JSON.stringify(payload))
+    .digest('hex');
+  
+  return hash === signature;
+}
+```
+
+3. PAYMENT STATUS CHECK
+-----------------------
+
+```javascript
+// GET /api/payments/:id/status
+async function checkPaymentStatus(req, res) {
+  const payment = await Payment.findById(req.params.id);
+  
+  // Query Kuickpay API to get latest status
+  const response = await axios.get(
+    `https://api.kuickpay.com/v1/payments/${payment.transaction_id}`,
+    {
+      headers: {
+        'Authorization': `Bearer ${process.env.KUICKPAY_API_KEY}`
+      }
+    }
+  );
+  
+  // Update local status if different
+  if (response.data.status !== payment.payment_status) {
+    await payment.update({
+      payment_status: response.data.status,
+      payment_gateway_response: response.data
+    });
+  }
+  
+  return res.json({
+    status: response.data.status,
+    payment
+  });
+}
+```
+
+================================================================================
+MOBILE APP IMPLEMENTATION (React Native):
+================================================================================
+
+1. PAYMENT SCREEN
+-----------------
+
+```javascript
+import { WebView } from 'react-native-webview';
+
+function PaymentScreen({ route }) {
+  const { challanId } = route.params;
+  const [paymentUrl, setPaymentUrl] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    initiatePayment();
+  }, []);
+
+  const initiatePayment = async () => {
+    try {
+      const response = await axios.post('/api/payments/initiate', {
+        challanId,
+        userId: currentUser.id
+      });
+      
+      setPaymentUrl(response.data.payment_url);
+      setLoading(false);
+    } catch (error) {
+      Alert.alert('Error', 'Failed to initiate payment');
+    }
+  };
+
+  const handleNavigationStateChange = (navState) => {
+    // Check if payment completed
+    if (navState.url.includes('/payment/success')) {
+      // Payment successful
+      navigation.navigate('PaymentSuccess');
+    } else if (navState.url.includes('/payment/cancel')) {
+      // Payment cancelled
+      navigation.goBack();
+    }
+  };
+
+  if (loading) {
+    return <LoadingScreen />;
+  }
+
+  return (
+    <WebView
+      source={{ uri: paymentUrl }}
+      onNavigationStateChange={handleNavigationStateChange}
+      startInLoadingState={true}
+    />
+  );
+}
+```
+
+2. PAYMENT SUCCESS HANDLER
+--------------------------
+
+```javascript
+function PaymentSuccessScreen() {
+  useEffect(() => {
+    // Refresh user data to get updated fee status
+    refreshUserData();
+    
+    // Show success message
+    showSuccessAnimation();
+  }, []);
+
+  return (
+    <View>
+      <Icon name="check-circle" size={80} color="green" />
+      <Text>Payment Successful!</Text>
+      <Text>Your fee has been paid successfully.</Text>
+      <Button title="View Receipt" onPress={downloadReceipt} />
+      <Button title="Back to Home" onPress={() => navigation.navigate('Home')} />
+    </View>
+  );
+}
+```
+
+================================================================================
+ALTERNATIVE: JAZZCASH INTEGRATION
+================================================================================
+
+If Kuickpay is not available, JazzCash is a popular alternative in Pakistan.
+
+JazzCash Merchant Integration Flow:
+1. Sign up at: https://merchant.jazzcash.com.pk
+2. Get Merchant ID and Password
+3. Use their Payment Gateway API
+4. Similar flow to Kuickpay with some API differences
+
+Key Differences:
+- JazzCash uses HMAC-SHA256 for integrity
+- Requires specific parameters like pp_Version, pp_TxnType
+- Has built-in Mobile Account payment option
+
+================================================================================
+TESTING CHECKLIST:
+================================================================================
+
+[ ] Sandbox environment setup and working
+[ ] Payment initiation creates correct payment record
+[ ] Payment URL redirects correctly in WebView
+[ ] Successful payment triggers webhook
+[ ] Webhook signature verification works
+[ ] Challan status updates after successful payment
+[ ] User fee status updates correctly
+[ ] Receipt generation works
+[ ] Push notification sent on payment success
+[ ] Failed payment handling works
+[ ] Cancelled payment handling works
+[ ] Payment timeout handling works
+[ ] Duplicate payment prevention works
+[ ] Webhook retry mechanism (if webhook fails first time)
+[ ] Payment reconciliation report works
+[ ] Refund functionality (if needed)
+
+================================================================================
+SECURITY BEST PRACTICES:
+================================================================================
+
+1. Store API keys in environment variables, never in code
+2. Use HTTPS for all communications
+3. Verify webhook signatures always
+4. Implement rate limiting on payment APIs
+5. Log all payment attempts for audit
+6. Never store credit card information
+7. Implement idempotency to prevent duplicate payments
+8. Set payment expiry time (e.g., 30 minutes)
+9. Monitor for suspicious activity
+10. Regular security audits
+
+================================================================================
+ERROR HANDLING:
+================================================================================
+
+Common Payment Errors:
+1. Insufficient Balance - Show user-friendly message
+2. Card Declined - Ask user to try different card
+3. Payment Gateway Timeout - Provide retry option
+4. Webhook Failed - Implement retry mechanism
+5. Network Error - Queue payment for later verification
+
+Always provide clear error messages to users and log detailed
+errors for debugging.
+
+================================================================================
+PRODUCTION DEPLOYMENT:
+================================================================================
+
+Before going live:
+1. Switch from sandbox to production API endpoints
+2. Update API keys to production credentials
+3. Test with real small amount transactions
+4. Set up monitoring and alerts
+5. Prepare customer support for payment issues
+6. Have payment reconciliation process in place
+7. Set up automated payment reports
+8. Configure backup payment gateway (if available)
+
+================================================================================
+RECONCILIATION PROCESS:
+================================================================================
+
+Daily reconciliation is important:
+1. Compare your database records with Kuickpay's settlement report
+2. Check for any mismatched transactions
+3. Investigate failed webhooks
+4. Update any pending payments
+5. Generate daily financial reports
+
+Implement automated reconciliation script that runs daily.
+
+================================================================================
+SAMPLE KUICKPAY API ENDPOINTS:
+================================================================================
+
+(Note: These are examples. Check official Kuickpay documentation for actual endpoints)
+
+Production:
+  Base URL: https://api.kuickpay.com/v1
+
+Sandbox:
+  Base URL: https://sandbox.kuickpay.com/v1
+
+Endpoints:
+  POST   /payments/create          - Create payment
+  GET    /payments/:id             - Get payment status
+  POST   /payments/:id/refund      - Refund payment
+  GET    /payments/list            - List all payments
+  GET    /settlements/report       - Get settlement report
+
+================================================================================
+CONTACT & SUPPORT:
+================================================================================
+
+Kuickpay Support:
+  Website: https://kuickpay.com
+  Email: support@kuickpay.com
+  Phone: (Check their website)
+
+For integration help:
+  Developer Docs: Check Kuickpay's developer portal
+  Integration Support: Contact their technical team
+
+================================================================================
+ADDITIONAL RESOURCES:
+================================================================================
+
+1. Study your university's current Kuickpay integration
+2. Ask your university IT department for guidance
+3. Review Kuickpay's official documentation
+4. Test thoroughly in sandbox before production
+5. Keep transaction logs for at least 1 year
+
+================================================================================
